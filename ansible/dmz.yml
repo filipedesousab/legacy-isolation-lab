@@ -1,0 +1,210 @@
+---
+# Acesso publico:     https://192.168.56.10
+# Rede corporativa:   https://192.168.57.10
+# A porta 80 redireciona para https nos dois IPs.
+- name: Provisionamento da VM DMZ (Borda / Proxy Reverso)
+  hosts: all
+  become: yes
+  vars:
+    cert_san: "DNS:legacy_app.local, IP Address:192.168.56.10, IP Address:192.168.57.10"
+  tasks:
+    - name: Instalar dependencias
+      apt:
+        name: ['docker.io', 'nftables', 'openssl']
+        state: present
+        update_cache: yes
+
+    - include_tasks: tasks/interfaces.yml
+      vars:
+        iface_ips:
+          publica: 192.168.56.10
+          corporativa: 192.168.57.10
+          interna: 192.168.60.10
+
+    - name: Criar diretorios do Nginx e WAF
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/nginx/templates
+        - /opt/nginx/certs
+
+    - name: Verificar SAN do certificado
+      command: openssl x509 -in /opt/nginx/certs/legacy_app.crt -noout -ext subjectAltName
+      register: current_san
+      changed_when: false
+      failed_when: false
+
+    - name: Gerar certificado SSL autoassinado
+      command: >
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048
+        -keyout /opt/nginx/certs/legacy_app.key
+        -out /opt/nginx/certs/legacy_app.crt
+        -subj "/C=BR/O=Development Lab/CN=legacy_app.local"
+        -addext "subjectAltName=DNS:legacy_app.local,IP:192.168.56.10,IP:192.168.57.10"
+      when: current_san.rc != 0 or (current_san.stdout_lines[-1:] | join | trim) != cert_san
+      notify: Recriar container do WAF
+
+    # O nginx da imagem roda com o usuario 101
+    - name: Permissao da chave privada
+      file:
+        path: /opt/nginx/certs/legacy_app.key
+        owner: '101'
+        group: '101'
+        mode: '0600'
+
+    # Substitui so o default.conf da imagem, o resto (modsecurity) ela mesma gera
+    - name: Configurar o Virtual Host do Nginx
+      copy:
+        dest: /opt/nginx/templates/default.conf.template
+        mode: '0644'
+        content: |
+          server_tokens off;
+          more_set_headers 'Server: ${SERVER_HEADER}';
+
+          map $http_upgrade $connection_upgrade {
+              default upgrade;
+              '' close;
+          }
+
+          map $host $https_host {
+              192.168.57.10     192.168.57.10;
+              legacy_app.local  legacy_app.local;
+              default           192.168.56.10;
+          }
+
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_session_cache shared:MozSSL:10m;
+          ssl_session_timeout 1d;
+          client_max_body_size 13m;
+
+          # Redireciona http para https
+          server {
+              listen 8080 default_server;
+              server_name _;
+
+              location / {
+                  return 301 https://$https_host$request_uri;
+              }
+          }
+
+          # Publico - https://192.168.56.10
+          server {
+              listen 8443 ssl default_server;
+              server_name legacy_app.local 192.168.56.10;
+
+              ssl_certificate /etc/nginx/certs/legacy_app.crt;
+              ssl_certificate_key /etc/nginx/certs/legacy_app.key;
+
+              # Bloqueio estrito na interface publica
+              location ~* ^/(_lib/prod|adminer\.php) {
+                  return 404;
+              }
+
+              location / {
+                  include includes/proxy_backend.conf;
+                  proxy_set_header X-Rota-Acesso "publica";
+              }
+
+              include includes/location_common.conf;
+          }
+
+          # Rede corporativa - https://192.168.57.10
+          server {
+              listen 9443 ssl default_server;
+              server_name 192.168.57.10;
+
+              ssl_certificate /etc/nginx/certs/legacy_app.crt;
+              ssl_certificate_key /etc/nginx/certs/legacy_app.key;
+
+              location / {
+                  include includes/proxy_backend.conf;
+                  proxy_set_header X-Rota-Acesso "corporativa";
+              }
+
+              include includes/location_common.conf;
+          }
+      notify: Recriar container do WAF
+
+    - name: Configurar nftables para a DMZ
+      copy:
+        dest: /etc/nftables.conf
+        validate: nft -c -f %s
+        content: |
+          #!/usr/sbin/nft -f
+          table inet filter
+          delete table inet filter
+          table inet filter {
+              chain prerouting {
+                  type filter hook prerouting priority raw; policy accept;
+
+                  # 9443 nao pode ser acessada direto
+                  iifname { "{{ if_nat }}", "{{ ifaces.publica }}", "{{ ifaces.corporativa }}", "{{ ifaces.interna }}" } tcp dport 9443 drop
+
+                  # 443 da rede corporativa vai para a 9443 do nginx
+                  iifname "{{ ifaces.corporativa }}" ip daddr 192.168.57.10 tcp dport 443 tcp dport set 9443
+              }
+
+              chain postrouting {
+                  type filter hook postrouting priority 300; policy accept;
+                  ip saddr 192.168.57.10 tcp sport 9443 tcp sport set 443
+              }
+
+              chain input {
+                  type filter hook input priority 0; policy drop;
+                  ct state established,related accept
+                  ip protocol icmp accept
+                  iifname "lo" accept
+
+                  # Libera SSH(para acessar via "vagrant ssh")
+                  iifname "{{ if_nat }}" tcp dport 22 accept
+
+                  # Docker Swarm
+                  iifname "{{ ifaces.interna }}" tcp dport 7946 accept
+                  iifname "{{ ifaces.interna }}" udp dport { 7946, 4789 } accept
+                  iifname "{{ ifaces.interna }}" meta l4proto esp accept
+              }
+
+              chain forward {
+                  type filter hook forward priority 0; policy drop;
+                  ct state established,related accept
+
+                  # Acesso publico
+                  iifname "{{ ifaces.publica }}" oifname "docker_gwbridge" ct status dnat ct original ip daddr 192.168.56.10 meta l4proto tcp ct original proto-dst { 80, 443 } accept
+
+                  # Acesso pela rede corporativa
+                  iifname "{{ ifaces.corporativa }}" oifname "docker_gwbridge" ct status dnat ct original ip daddr 192.168.57.10 meta l4proto tcp ct original proto-dst { 80, 9443 } accept
+              }
+
+              chain output {
+                  type filter hook output priority 0; policy accept;
+              }
+          }
+      notify: Aplicar nftables
+
+    - name: Habilitar nftables no boot
+      systemd:
+        name: nftables
+        enabled: yes
+
+    - name: Aguardar Manager criar o token do Swarm
+      wait_for:
+        path: /vagrant/worker_token
+        timeout: 300
+
+    - name: Verificar estado do Swarm
+      command: docker info --format '{{ "{{" }} .Swarm.LocalNodeState {{ "}}" }}'
+      register: swarm_state
+      changed_when: false
+
+    - name: Ingressar no Docker Swarm
+      shell: "docker swarm join --token $(cat /vagrant/worker_token) 192.168.60.20:2377"
+      when: swarm_state.stdout != "active"
+
+  handlers:
+    - name: Aplicar nftables
+      command: nft -f /etc/nftables.conf
+
+    - name: Recriar container do WAF
+      shell: docker ps -q --filter label=com.docker.swarm.service.name=lab_proxy-waf | xargs -r docker rm -f

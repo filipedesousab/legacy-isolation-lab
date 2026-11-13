@@ -1,0 +1,70 @@
+---
+- name: Provisionamento da VM Swarm Worker (App)
+  hosts: all
+  become: yes
+  tasks:
+    - name: Instalar dependencias
+      apt:
+        name: ['docker.io', 'nftables']
+        state: present
+        update_cache: yes
+
+    - include_tasks: tasks/interfaces.yml
+      vars:
+        iface_ips: { interna: 192.168.60.30 }
+
+    - name: Configurar nftables com trava de Egress
+      copy:
+        dest: /etc/nftables.conf
+        validate: nft -c -f %s
+        content: |
+          #!/usr/sbin/nft -f
+          table inet filter
+          delete table inet filter
+          table inet filter {
+              chain input {
+                  type filter hook input priority 0; policy drop;
+                  ct state established,related accept
+                  iifname "lo" accept
+                  # Para acessar via "vagrant ssh"
+                  iifname "{{ if_nat }}" tcp dport 22 accept
+                  iifname "{{ ifaces.interna }}" tcp dport 7946 accept
+                  iifname "{{ ifaces.interna }}" udp dport { 7946, 4789 } accept
+                  iifname "{{ ifaces.interna }}" meta l4proto esp accept
+              }
+              chain forward {
+                  type filter hook forward priority -10; policy drop;
+                  ct state established,related accept
+
+                  # Container PHP só pode acessar o IP do Banco na porta 5432
+                  iifname "docker*" oifname "{{ ifaces.interna }}" ip daddr 192.168.60.40 tcp dport 5432 accept
+              }
+          }
+      notify: Aplicar nftables
+
+    - name: Habilitar nftables no boot
+      systemd:
+        name: nftables
+        enabled: yes
+
+    # network host para o build nao ser bloqueado pela trava de egress
+    - name: Fazer build da imagem Docker (legacy_app:local)
+      command: docker build --network host -t legacy_app:local /vagrant/app/
+
+    - name: Aguardar Manager criar o token do Swarm
+      wait_for:
+        path: /vagrant/worker_token
+        timeout: 300
+
+    - name: Verificar estado do Swarm
+      command: docker info --format '{{ "{{" }} .Swarm.LocalNodeState {{ "}}" }}'
+      register: swarm_state
+      changed_when: false
+
+    - name: Ingressar no Docker Swarm
+      shell: "docker swarm join --token $(cat /vagrant/worker_token) 192.168.60.20:2377"
+      when: swarm_state.stdout != "active"
+
+  handlers:
+    - name: Aplicar nftables
+      command: nft -f /etc/nftables.conf

@@ -1,0 +1,100 @@
+---
+- name: Provisionamento da VM Banco de Dados (PostgreSQL)
+  hosts: all
+  become: yes
+  vars:
+    db_name: legacy_app
+    db_user: usuario
+    db_password: senha
+  tasks:
+    - name: Instalar PostgreSQL e nftables
+      apt:
+        name:
+          - postgresql-18
+          - postgresql-contrib-18
+          - nftables
+        state: present
+        update_cache: yes
+
+    - include_tasks: tasks/interfaces.yml
+      vars:
+        iface_ips: { interna: 192.168.60.40 }
+
+    - name: Configurar Firewall com trava de Ingress
+      copy:
+        dest: /etc/nftables.conf
+        validate: nft -c -f %s
+        content: |
+          #!/usr/sbin/nft -f
+          table inet filter
+          delete table inet filter
+          table inet filter {
+              chain input {
+                  type filter hook input priority 0; policy drop;
+                  ct state established,related accept
+                  iifname "lo" accept
+                  # Para acessar via "vagrant ssh"
+                  iifname "{{ if_nat }}" tcp dport 22 accept
+
+                  # Aceitar trafego na 5432 APENAS do Swarm Worker (192.168.60.30)
+                  iifname "{{ ifaces.interna }}" ip saddr 192.168.60.30 tcp dport 5432 accept
+              }
+          }
+      notify: Aplicar nftables
+
+    - name: Habilitar nftables no boot
+      systemd:
+        name: nftables
+        enabled: yes
+        state: started
+
+    - name: Configurar listen_addresses e criptografia legada no PostgreSQL
+      lineinfile:
+        path: /etc/postgresql/18/main/postgresql.conf
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: "^#?listen_addresses", line: "listen_addresses = '*'" }
+        - { regexp: "^#?password_encryption", line: "password_encryption = md5" }
+      notify: Reiniciar PostgreSQL
+
+    - name: Configurar autenticacao apenas para a VM worker
+      lineinfile:
+        path: /etc/postgresql/18/main/pg_hba.conf
+        line: "host all all 192.168.60.30/32 md5"
+        insertafter: EOF
+      notify: Reiniciar PostgreSQL
+
+    - name: Reiniciar antes de criar o usuario
+      meta: flush_handlers
+
+    # PHP 5.6 nao suporta scram, por isso md5
+    - name: Criar usuario do banco
+      shell: |
+        runuser -u postgres -- psql -v ON_ERROR_STOP=1 -qtA <<'SQL'
+        SET password_encryption = 'md5';
+        SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{{ db_user }}')
+          THEN 'ALTER ROLE {{ db_user }} LOGIN PASSWORD ''{{ db_password }}'''
+          ELSE 'CREATE ROLE {{ db_user }} LOGIN PASSWORD ''{{ db_password }}'''
+        END \gexec
+        SQL
+      changed_when: false
+      no_log: true
+
+    - name: Criar banco de dados
+      shell: |
+        runuser -u postgres -- psql -v ON_ERROR_STOP=1 -tA <<'SQL'
+        SELECT 'CREATE DATABASE {{ db_name }} OWNER {{ db_user }}'
+        WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '{{ db_name }}') \gexec
+        SQL
+      register: create_db
+      changed_when: "'CREATE DATABASE' in create_db.stdout"
+
+  handlers:
+    - name: Aplicar nftables
+      command: nft -f /etc/nftables.conf
+
+    - name: Reiniciar PostgreSQL
+      systemd:
+        name: postgresql
+        state: restarted

@@ -1,0 +1,24 @@
+---
+# Descobre o nome das interfaces pelo IP
+
+- name: Interface NAT
+  set_fact:
+    if_nat: "{{ ansible_facts['default_ipv4']['interface'] }}"
+
+- name: Buscar interfaces pelo IP
+  command: "ip -o -4 addr show to {{ item.value }}"
+  loop: "{{ iface_ips | dict2items }}"
+  register: iface_lookup
+  changed_when: false
+  failed_when: iface_lookup.stdout | length == 0
+
+- name: Salvar nomes das interfaces
+  set_fact:
+    ifaces: "{{ ifaces | default({}) | combine({item.item.key: item.stdout.split()[1]}) }}"
+  loop: "{{ iface_lookup.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Mostrar interfaces
+  debug:
+    msg: "NAT={{ if_nat }} {{ ifaces }}"

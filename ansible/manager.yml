@@ -1,0 +1,73 @@
+---
+- name: Provisionamento da VM Swarm Manager
+  hosts: all
+  become: yes
+  tasks:
+    - name: Instalar Docker e nftables
+      apt:
+        name: ['docker.io', 'nftables']
+        state: present
+        update_cache: yes
+
+    - include_tasks: tasks/interfaces.yml
+      vars:
+        iface_ips: { interna: 192.168.60.20 }
+
+    - name: Configurar nftables para o Manager
+      copy:
+        dest: /etc/nftables.conf
+        validate: nft -c -f %s
+        content: |
+          #!/usr/sbin/nft -f
+          table inet filter
+          delete table inet filter
+          table inet filter {
+              chain input {
+                  type filter hook input priority 0; policy drop;
+                  ct state established,related accept
+                  iifname "lo" accept
+                  # Libera porta 22 para o "vagrant ssh"
+                  iifname "{{ if_nat }}" tcp dport 22 accept
+                  # Libera Docker Swarm na rede interna
+                  iifname "{{ ifaces.interna }}" tcp dport { 2377, 7946 } accept
+                  iifname "{{ ifaces.interna }}" udp dport { 7946, 4789 } accept
+                  # ESP da rede overlay criptografada
+                  iifname "{{ ifaces.interna }}" meta l4proto esp accept
+              }
+              chain forward {
+                  type filter hook forward priority 0; policy drop;
+              }
+          }
+      notify: Aplicar nftables
+
+    - name: Habilitar nftables no boot
+      systemd:
+        name: nftables
+        enabled: yes
+
+    - name: Verificar estado do Swarm
+      command: docker info --format '{{ "{{" }} .Swarm.LocalNodeState {{ "}}" }}'
+      register: swarm_state
+      changed_when: false
+
+    - name: Iniciar o Docker Swarm
+      command: docker swarm init --advertise-addr 192.168.60.20
+      when: swarm_state.stdout != "active"
+
+    - name: Exportar token de Worker para o Vagrant
+      shell: docker swarm join-token -q worker > /vagrant/worker_token
+      changed_when: false
+
+    - name: Copiar manifesto do Swarm da pasta do projeto
+      copy:
+        src: /vagrant/app/docker-compose.yml
+        dest: /root/docker-compose.yml
+        remote_src: yes
+
+    # A imagem legacy_app:local so existe no worker
+    - name: Executar o deploy da Stack
+      command: docker stack deploy --detach=true --resolve-image never -c /root/docker-compose.yml lab
+
+  handlers:
+    - name: Aplicar nftables
+      command: nft -f /etc/nftables.conf
